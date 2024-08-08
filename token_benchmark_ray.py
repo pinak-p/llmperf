@@ -1,3 +1,6 @@
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import concurrent.futures
 import argparse
 from collections.abc import Iterable
 import json
@@ -9,6 +12,7 @@ import random
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+import numpy as np
 import ray
 
 from llmperf import common_metrics
@@ -67,17 +71,17 @@ def get_token_throughput_latencies(
     if not additional_sampling_params:
         additional_sampling_params = {}
 
-    clients = construct_clients(llm_api=llm_api, num_clients=num_concurrent_requests)
-    req_launcher = RequestsLauncher(clients)
+    completed_requests_lock = threading.Lock()
     completed_requests = []
     num_completed_requests = 0
     # make up prompts outside of send loop for faster benchmarking loop
     num_output_tokens_list = []
     prompts = []
     for i in range(max_num_completed_requests):
-        num_output_tokens = (sample_random_positive_int(
-            mean_output_tokens, stddev_output_tokens
-        ))
+        #num_output_tokens = (sample_random_positive_int(
+        #    mean_output_tokens, stddev_output_tokens
+        #))
+        num_output_tokens = mean_output_tokens
         num_output_tokens_list.append(num_output_tokens)
 
         prompts.append(randomly_sample_sonnet_lines_prompt(
@@ -86,67 +90,75 @@ def get_token_throughput_latencies(
             expect_output_tokens=num_output_tokens,
             tokenizer=tokenizer
         ))
-    start_time = time.monotonic()
-    iter = 0
-    pbar = tqdm(total=max_num_completed_requests)
-    while (
-        time.monotonic() - start_time < test_timeout_s
-        and len(completed_requests) < max_num_completed_requests
-    ):
-        iter += 1
+    #pbar = tqdm(total=max_num_completed_requests)
 
-        default_sampling_params = {"max_tokens": num_output_tokens_list.pop()}
-        default_sampling_params.update(additional_sampling_params)
-        request_config = RequestConfig(
-            model=model,
-            prompt=prompts.pop(),
-            sampling_params=default_sampling_params,
-            llm_api=llm_api,
-        )
-        req_launcher.launch_requests(request_config)
-        # Retrieving results less frequently allows for more concurrent requests
-        # to be launched. This will overall reduce the amount of time it takes
-        # for the test to run.
-        if not (iter % num_concurrent_requests):
+    def launch_request(prompts):
+
+        clients = construct_clients(llm_api=llm_api, num_clients=1)
+        req_launcher = RequestsLauncher(clients)
+        
+        completed_requests = []
+        for p in prompts:
+
+            default_sampling_params = {"max_tokens": mean_output_tokens }
+            default_sampling_params.update(additional_sampling_params)
+            request_config = RequestConfig(
+                model=model,
+                prompt=p,
+                sampling_params=default_sampling_params,
+                llm_api=llm_api,
+            )
+            req_launcher.launch_requests(request_config)
+
             outs = req_launcher.get_next_ready()
             all_metrics = []
             for out in outs:
+
                 request_metrics, gen_text, _ = out
                 num_output_tokens = get_token_length(gen_text)
-                if num_output_tokens: 
-                    request_metrics[common_metrics.INTER_TOKEN_LAT] /= num_output_tokens
+                
+                if num_output_tokens:
+                    request_metrics[common_metrics.INTER_TOKEN_LAT] /= request_metrics[common_metrics.NUM_OUTPUT_TOKENS]
                 else:
                     request_metrics[common_metrics.INTER_TOKEN_LAT] = 0
                 request_metrics[common_metrics.NUM_OUTPUT_TOKENS] = num_output_tokens
                 request_metrics[common_metrics.NUM_TOTAL_TOKENS] = request_metrics[common_metrics.NUM_INPUT_TOKENS] + num_output_tokens
                 request_metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = num_output_tokens / request_metrics[common_metrics.E2E_LAT]
                 all_metrics.append(request_metrics)
-            completed_requests.extend(all_metrics)
-        pbar.update(len(completed_requests) - num_completed_requests)
-        num_completed_requests = len(completed_requests)
-
-    pbar.close()
-    end_time = time.monotonic()
-    if end_time - start_time >= test_timeout_s:
-        print("Test timed out before all requests could be completed.")
-
-    # check one last time that there are no remaining results to collect.
-    outs = req_launcher.get_next_ready()
-    all_metrics = []
-    for out in outs:
-        request_metrics, gen_text, _ = out
-        num_output_tokens = get_token_length(gen_text)
-        if num_output_tokens: 
-            request_metrics[common_metrics.INTER_TOKEN_LAT] /= num_output_tokens
-        else:
-            request_metrics[common_metrics.INTER_TOKEN_LAT] = 0
-        request_metrics[common_metrics.NUM_OUTPUT_TOKENS] = num_output_tokens
-        request_metrics[common_metrics.NUM_TOTAL_TOKENS] = request_metrics[common_metrics.NUM_INPUT_TOKENS] + num_output_tokens
-        request_metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = num_output_tokens / request_metrics[common_metrics.E2E_LAT]
+                completed_requests.extend(all_metrics)
+                #pbar.update(len(all_metrics))
+                #num_completed_requests += len(all_metrics)
                 
-        all_metrics.append(request_metrics)
-    completed_requests.extend(all_metrics)
+        return completed_requests
 
+    prompts = np.array_split(prompts, num_concurrent_requests)
+
+    #warm up
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        start_time = time.monotonic()
+
+        futures = [executor.submit(launch_request, list(prompt_subset)) for prompt_subset in prompts[:2]]
+        # wait for all tasks to complete
+        done, futures = concurrent.futures.wait(
+            futures, return_when=concurrent.futures.ALL_COMPLETED
+        )
+    print("warmup completed .... benchmarking")
+
+    #benchmark
+    with ThreadPoolExecutor(max_workers=num_concurrent_requests) as executor:
+        start_time = time.monotonic()
+
+        futures = [executor.submit(launch_request, list(prompt_subset)) for prompt_subset in prompts]
+        # wait for all tasks to complete
+        done, futures = concurrent.futures.wait(
+            futures, return_when=concurrent.futures.ALL_COMPLETED
+        )
+
+        end_time = time.monotonic()
+    completed_requests = []
+    for fut in done:
+        completed_requests.extend(fut.result())
+    
     print(f"\Results for token benchmark for {model} queried with the {llm_api} api.\n")
     ret = metrics_summary(completed_requests, start_time, end_time)
 
