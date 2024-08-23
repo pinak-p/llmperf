@@ -6,7 +6,7 @@ import subprocess
 import time
 from typing import Any, Dict, Tuple
 
-from transformers import LlamaTokenizerFast
+from transformers import LlamaTokenizerFast, AutoTokenizer
 
 
 RESULTS_VERSION = "2023-08-31"
@@ -55,13 +55,22 @@ def upload_to_s3(results_path: str, s3_path: str) -> None:
         print("An error occurred:")
         print(result.stderr)
 
+def get_prompt_template_token_count(tokenizer, prompt) -> int:
+    message = [
+        {"role": "system", "content": ""},
+        {"role": "user", "content": prompt},
+    ]
+    prompt_template = tokenizer.apply_chat_template(conversation=message,
+    tokenize=False,
+    add_generation_prompt=True)
+    return len(tokenizer(prompt_template).input_ids)
+    
 
 def randomly_sample_sonnet_lines_prompt(
+    tokenizer: AutoTokenizer
     prompt_tokens_mean: int = 550,
     prompt_tokens_stddev: int = 250,
-    expect_output_tokens: int = 150,
-    tokenizer = LlamaTokenizerFast.from_pretrained(
-        "hf-internal-testing/llama-tokenizer")
+    expect_output_tokens: int = 150
 ) -> Tuple[str, int]:
     """Generate a prompt that randomly samples lines from a the shakespeare sonnet at sonnet.txt.
 
@@ -82,7 +91,7 @@ def randomly_sample_sonnet_lines_prompt(
         A tuple of the prompt and the length of the prompt.
     """
 
-    get_token_length = lambda text: len(tokenizer.encode(text))
+    get_token_length = lambda text: len(tokenizer(text).input_ids)
 
     prompt = (
         "Randomly stream lines from the following text "
@@ -97,7 +106,10 @@ def randomly_sample_sonnet_lines_prompt(
         num_prompt_tokens = sample_random_positive_int(
             prompt_tokens_mean, prompt_tokens_stddev
         )
-    remaining_prompt_tokens = num_prompt_tokens - get_token_length(prompt)
+    
+    #prompt template is added by vllm, apply the same on the client to accurately count the tokens being sent as input
+    remaining_prompt_tokens = num_prompt_tokens - get_prompt_template_token_count(tokenizer, prompt)
+
     sonnet_path = pathlib.Path(__file__).parent.resolve() / "sonnet.txt"
     with open(sonnet_path, "r") as f:
         sonnet_lines = f.readlines()
