@@ -22,8 +22,7 @@ from llmperf.models import RequestConfig
 from llmperf.requests_launcher import RequestsLauncher
 from llmperf.utils import (
     randomly_sample_sonnet_lines_prompt,
-    LLMPerfResults,
-    sample_random_positive_int,
+    LLMPerfResults
 )
 from tqdm import tqdm
 
@@ -71,18 +70,12 @@ def get_token_throughput_latencies(
     if not additional_sampling_params:
         additional_sampling_params = {}
 
-    completed_requests_lock = threading.Lock()
     completed_requests = []
-    num_completed_requests = 0
     # make up prompts outside of send loop for faster benchmarking loop
-    num_output_tokens_list = []
     prompts = []
     for i in range(max_num_completed_requests):
-        #num_output_tokens = (sample_random_positive_int(
-        #    mean_output_tokens, stddev_output_tokens
-        #))
+       
         num_output_tokens = mean_output_tokens
-        num_output_tokens_list.append(num_output_tokens)
 
         prompts.append(randomly_sample_sonnet_lines_prompt(
             prompt_tokens_mean=mean_input_tokens,
@@ -126,8 +119,6 @@ def get_token_throughput_latencies(
                 request_metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = num_output_tokens / request_metrics[common_metrics.E2E_LAT]
                 all_metrics.append(request_metrics)
                 completed_requests.extend(all_metrics)
-                #pbar.update(len(all_metrics))
-                #num_completed_requests += len(all_metrics)
                 
         return completed_requests
 
